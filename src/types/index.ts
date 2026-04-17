@@ -1,10 +1,12 @@
 export type RiskLevel = 'low' | 'medium' | 'high' | 'critical';
 export type TokenDecision = 'safe' | 'caution' | 'avoid';
 export type Chain = 'ethereum' | 'bsc' | 'solana';
+export type UseCase = 'trading' | 'wallet_display' | 'token_listing' | 'bot_filtering';
 
 export interface CheckRequest {
   contract: string;
   chain?: Chain;
+  use_case?: UseCase;
 }
 
 export interface BatchRequest {
@@ -50,10 +52,13 @@ export interface TokenTrustResponse {
   id: string;
   contract: string;
   chain: Chain;
+  use_case: UseCase;
   trust_score: number;
   risk_level: RiskLevel;
   decision: TokenDecision;
+  confidence: number;
   flags: string[];
+  reasons: string[];
   recommendation: string;
   security: TokenSecurity;
   liquidity?: LiquidityInfo;

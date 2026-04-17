@@ -4,12 +4,34 @@ import { config } from '../utils/config';
 import { logger } from '../utils/logger';
 import { getTokenSecurity, getDexInfo } from '../utils/goplus';
 import { detectChain } from '../utils/validation';
-import type { CheckRequest, TokenTrustResponse, RiskLevel, TokenDecision, Chain } from '../types/index';
+import type { CheckRequest, TokenTrustResponse, RiskLevel, TokenDecision, Chain, UseCase } from '../types/index';
 
 const client = new Anthropic({ apiKey: config.anthropic.apiKey });
 
+// Use case thresholds — stricter for trading/bots, lenient for display
+const USE_CASE_THRESHOLDS: Record<UseCase, { avoidAt: number; cautionAt: number }> = {
+  trading:       { avoidAt: 50, cautionAt: 20 },
+  bot_filtering: { avoidAt: 40, cautionAt: 15 },
+  token_listing: { avoidAt: 60, cautionAt: 30 },
+  wallet_display:{ avoidAt: 70, cautionAt: 35 },
+};
+
 function getRiskLevel(score: number): RiskLevel { return score >= 80 ? 'critical' : score >= 50 ? 'high' : score >= 20 ? 'medium' : 'low'; }
-function getDecision(score: number): TokenDecision { return score >= 60 ? 'avoid' : score >= 30 ? 'caution' : 'safe'; }
+
+function getDecision(score: number, useCase: UseCase): TokenDecision {
+  const t = USE_CASE_THRESHOLDS[useCase];
+  if (score >= t.avoidAt) return 'avoid';
+  if (score >= t.cautionAt) return 'caution';
+  return 'safe';
+}
+
+function getConfidence(hasSecurityData: boolean, hasLiquidityData: boolean, holderCount: number): number {
+  let confidence = 0.5;
+  if (hasSecurityData) confidence += 0.3;
+  if (hasLiquidityData) confidence += 0.1;
+  if (holderCount > 1000) confidence += 0.1;
+  return parseFloat(Math.min(0.95, confidence).toFixed(2));
+}
 
 function safeNum(val: unknown, fallback = 0): number {
   const n = parseFloat(String(val ?? fallback));
@@ -23,12 +45,41 @@ function safeBool(val: unknown): boolean {
   return false;
 }
 
+function buildReasons(flags: string[], decision: TokenDecision): string[] {
+  const reasonMap: Record<string, string> = {
+    honeypot: 'Cannot sell after buying — confirmed honeypot',
+    honeypot_creator_pattern: 'Creator has deployed other honeypots',
+    owner_can_mint: 'Owner can create unlimited tokens — dilution risk',
+    owner_can_blacklist: 'Owner can prevent you from selling',
+    slippage_modifiable: 'Owner can change taxes at any time',
+    high_sell_tax: 'High sell tax makes profitable exit difficult',
+    not_open_source: 'Contract code is hidden — cannot be audited',
+    low_liquidity: 'Low liquidity — high price impact on trades',
+    no_dex_liquidity: 'No DEX liquidity detected',
+    creator_holds_majority: 'Creator holds majority of supply — rug pull risk',
+    proxy_contract: 'Upgradeable proxy — contract logic can be changed',
+    liquidity_not_locked: 'Liquidity not locked — can be removed anytime',
+  };
+
+  if (decision === 'safe' && flags.includes('no_risk_flags_detected')) {
+    return ['No significant risk flags detected'];
+  }
+
+  return flags
+    .filter(f => !f.includes('no_risk'))
+    .map(f => {
+      const baseFlag = f.replace(/_\d+pct$/, '').replace(/^elevated_/, '').replace(/^high_/, 'high_');
+      return reasonMap[baseFlag] ?? f.replace(/_/g, ' ');
+    })
+    .slice(0, 5);
+}
+
 export async function checkToken(req: CheckRequest): Promise<TokenTrustResponse> {
   const id = `token_${uuidv4().replace(/-/g, '').slice(0, 12)}`;
   const t0 = Date.now();
   const contract = req.contract.trim();
+  const useCase = req.use_case ?? 'trading';
 
-  // Auto-detect chain
   let chain: Chain;
   if (req.chain) {
     chain = req.chain;
@@ -37,7 +88,7 @@ export async function checkToken(req: CheckRequest): Promise<TokenTrustResponse>
     chain = detected === 'unknown' ? 'ethereum' : detected as Chain;
   }
 
-  logger.info({ id, contract, chain }, 'Starting token trust check');
+  logger.info({ id, contract, chain, useCase }, 'Starting token trust check');
 
   const [securityData, dexData] = await Promise.all([
     getTokenSecurity(contract, chain),
@@ -47,7 +98,6 @@ export async function checkToken(req: CheckRequest): Promise<TokenTrustResponse>
   const flags: string[] = [];
   let riskScore = 0;
 
-  // Parse security data
   const sec = securityData as Record<string, unknown> | null;
   const dex = dexData as Record<string, unknown> | null;
 
@@ -58,14 +108,12 @@ export async function checkToken(req: CheckRequest): Promise<TokenTrustResponse>
   const ownerCanBlacklist = safeBool(sec?.is_blacklisted);
   const hasProxy = safeBool(sec?.is_proxy);
   const isOpenSource = safeBool(sec?.is_open_source);
-  const isVerified = isOpenSource;
   const buyTax = safeNum(sec?.buy_tax) * 100;
   const sellTax = safeNum(sec?.sell_tax) * 100;
   const slippageModifiable = safeBool(sec?.slippage_modifiable);
   const isAntiWhale = safeBool(sec?.is_anti_whale);
   const transferPausable = safeBool(sec?.transfer_pausable);
 
-  // Risk scoring
   if (isHoneypot) { riskScore += 90; flags.push('honeypot'); }
   if (honeypotSameCreator) { riskScore += 40; flags.push('honeypot_creator_pattern'); }
   if (ownerCanMint) { riskScore += 30; flags.push('owner_can_mint'); }
@@ -78,16 +126,15 @@ export async function checkToken(req: CheckRequest): Promise<TokenTrustResponse>
   else if (sellTax > 5) { riskScore += 10; flags.push(`elevated_sell_tax_${Math.round(sellTax)}pct`); }
   if (buyTax > 10) { riskScore += 15; flags.push(`high_buy_tax_${Math.round(buyTax)}pct`); }
 
-  // Holder concentration
-  const top10Percent = safeNum(sec?.holder_count ? (sec?.top10_holder_rate ?? 0) : 0) * 100;
+  const top10Percent = safeNum(sec?.top10_holder_rate) * 100;
   const creatorPercent = safeNum(sec?.creator_percent) * 100;
   const ownerPercent = safeNum(sec?.owner_percent) * 100;
+  const holderCount = safeNum(sec?.holder_count);
 
   if (creatorPercent > 50) { riskScore += 30; flags.push('creator_holds_majority'); }
   else if (creatorPercent > 20) { riskScore += 15; flags.push('creator_high_concentration'); }
   if (top10Percent > 80) { riskScore += 20; flags.push('top10_holders_dominant'); }
 
-  // Liquidity
   const dexList = (dex?.dex as { name: string }[] ?? []).map(d => d.name).filter(Boolean);
   const totalLiquidity = safeNum(dex?.liquidity);
   const liquidityLocked = safeBool(dex?.is_locked);
@@ -100,7 +147,9 @@ export async function checkToken(req: CheckRequest): Promise<TokenTrustResponse>
 
   riskScore = Math.min(100, riskScore);
   const riskLevel = getRiskLevel(riskScore);
-  const decision = getDecision(riskScore);
+  const decision = getDecision(riskScore, useCase);
+  const confidence = getConfidence(!!sec, !!dex, holderCount);
+  const reasons = buildReasons(flags, decision);
 
   const recommendation = decision === 'avoid'
     ? 'Avoid — high risk of scam or rug pull detected'
@@ -108,22 +157,19 @@ export async function checkToken(req: CheckRequest): Promise<TokenTrustResponse>
     ? 'Caution — some risk signals present, research before investing'
     : 'Safe — no significant risk flags detected';
 
-  // Claude summary
   let summary = '';
   try {
     const prompt = `Summarize this token security analysis in 2-3 sentences for a crypto user.
 
 Contract: ${contract}
 Chain: ${chain}
+Use case: ${useCase}
 Risk score: ${riskScore}/100
 Decision: ${decision}
+Confidence: ${confidence}
 Flags: ${flags.join(', ')}
-Is honeypot: ${isHoneypot}
-Owner can mint: ${ownerCanMint}
-Sell tax: ${sellTax}%
-Open source: ${isOpenSource}
 
-Return ONLY a plain English summary string, no JSON.`;
+Return ONLY a plain English summary, no JSON.`;
 
     const response = await client.messages.create({
       model: config.anthropic.model,
@@ -133,16 +179,16 @@ Return ONLY a plain English summary string, no JSON.`;
     summary = response.content.find(b => b.type === 'text')?.text?.trim() ?? '';
   } catch (err) {
     logger.warn({ id, err }, 'Claude summary failed');
-    summary = `Token ${contract} on ${chain} has a risk score of ${riskScore}/100 with decision: ${decision}. ${flags.length > 0 ? `Risk flags: ${flags.slice(0, 3).join(', ')}.` : 'No significant risk flags detected.'}`;
+    summary = `Token ${contract} on ${chain} scored ${riskScore}/100 risk with decision: ${decision} (confidence: ${confidence}). ${reasons.slice(0, 2).join('. ')}.`;
   }
 
-  logger.info({ id, contract, chain, riskScore, decision }, 'Token trust check complete');
+  logger.info({ id, contract, chain, useCase, riskScore, decision, confidence }, 'Token trust check complete');
 
   return {
-    id, contract, chain,
+    id, contract, chain, use_case: useCase,
     trust_score: Math.max(0, 100 - riskScore),
     risk_level: riskLevel,
-    decision, flags, recommendation,
+    decision, confidence, flags, reasons, recommendation,
     security: {
       is_honeypot: isHoneypot,
       honeypot_with_same_creator: honeypotSameCreator,
@@ -151,7 +197,7 @@ Return ONLY a plain English summary string, no JSON.`;
       owner_can_blacklist: ownerCanBlacklist,
       has_proxy_contract: hasProxy,
       is_open_source: isOpenSource,
-      is_verified: isVerified,
+      is_verified: isOpenSource,
       buy_tax: buyTax,
       sell_tax: sellTax,
       transfer_pausable: transferPausable,
@@ -170,7 +216,7 @@ Return ONLY a plain English summary string, no JSON.`;
         name: String(sec.token_name ?? ''),
         symbol: String(sec.token_symbol ?? ''),
         total_supply: String(sec.total_supply ?? ''),
-        holder_count: safeNum(sec.holder_count),
+        holder_count: holderCount,
         creator_address: String(sec.creator_address ?? ''),
         creator_percent: creatorPercent,
         owner_address: String(sec.owner_address ?? ''),
