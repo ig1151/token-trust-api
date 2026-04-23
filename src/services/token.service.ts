@@ -1,5 +1,5 @@
 import { v4 as uuidv4 } from 'uuid';
-import { config } from '../utils/config';
+
 import { logger } from '../utils/logger';
 import { getTokenSecurity, getDexInfo } from '../utils/goplus';
 import { detectChain } from '../utils/validation';
