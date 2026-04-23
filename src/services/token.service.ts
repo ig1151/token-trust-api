@@ -1,4 +1,3 @@
-import Anthropic from '@anthropic-ai/sdk';
 import { v4 as uuidv4 } from 'uuid';
 import { config } from '../utils/config';
 import { logger } from '../utils/logger';
@@ -6,9 +5,9 @@ import { getTokenSecurity, getDexInfo } from '../utils/goplus';
 import { detectChain } from '../utils/validation';
 import type { CheckRequest, TokenTrustResponse, RiskLevel, TokenDecision, Chain, UseCase } from '../types/index';
 
-const client = new Anthropic({ apiKey: config.anthropic.apiKey });
+const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const MODEL = 'anthropic/claude-sonnet-4-5';
 
-// Use case thresholds — stricter for trading/bots, lenient for display
 const USE_CASE_THRESHOLDS: Record<UseCase, { avoidAt: number; cautionAt: number }> = {
   trading:       { avoidAt: 50, cautionAt: 20 },
   bot_filtering: { avoidAt: 40, cautionAt: 15 },
@@ -159,6 +158,9 @@ export async function checkToken(req: CheckRequest): Promise<TokenTrustResponse>
 
   let summary = '';
   try {
+    const apiKey = process.env.OPENROUTER_API_KEY;
+    if (!apiKey) throw new Error('OPENROUTER_API_KEY not set');
+
     const prompt = `Summarize this token security analysis in 2-3 sentences for a crypto user.
 
 Contract: ${contract}
@@ -171,14 +173,24 @@ Flags: ${flags.join(', ')}
 
 Return ONLY a plain English summary, no JSON.`;
 
-    const response = await client.messages.create({
-      model: config.anthropic.model,
-      max_tokens: 150,
-      messages: [{ role: 'user', content: prompt }],
+    const response = await fetch(OPENROUTER_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model: MODEL,
+        max_tokens: 150,
+        messages: [{ role: 'user', content: prompt }],
+      }),
     });
-    summary = response.content.find(b => b.type === 'text')?.text?.trim() ?? '';
+
+    if (!response.ok) throw new Error(`OpenRouter error: ${response.status}`);
+    const data = await response.json() as { choices: { message: { content: string } }[] };
+    summary = data.choices[0].message.content.trim();
   } catch (err) {
-    logger.warn({ id, err }, 'Claude summary failed');
+    logger.warn({ id, err }, 'OpenRouter summary failed');
     summary = `Token ${contract} on ${chain} scored ${riskScore}/100 risk with decision: ${decision} (confidence: ${confidence}). ${reasons.slice(0, 2).join('. ')}.`;
   }
 
